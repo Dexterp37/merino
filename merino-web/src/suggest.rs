@@ -7,11 +7,14 @@ use actix_web::{
     HttpResponse,
 };
 use anyhow::Result;
+use async_recursion::async_recursion;
 use cadence::{Histogrammed, StatsdClient};
 use merino_adm::remote_settings::RemoteSettingsSuggester;
 use merino_cache::{MemoryCacheSuggester, RedisCacheSuggester};
-use merino_settings::{CacheType, Settings};
-use merino_suggest::{DebugProvider, Suggestion, SuggestionProvider, WikiFruit};
+use merino_settings::{providers::SuggestionProviderConfig, Settings};
+use merino_suggest::{
+    DebugProvider, Multi, NullProvider, Suggestion, SuggestionProvider, WikiFruit,
+};
 use serde::Serialize;
 use tokio::sync::OnceCell;
 use tracing_futures::Instrument;
@@ -91,44 +94,48 @@ impl SuggestionProviderRef {
         self.0
             .get_or_try_init(|| {
                 async {
-                    let settings = settings;
                     tracing::info!(
                         r#type = "web.configuring-suggesters",
                         "Setting up suggestion providers"
                     );
 
-                    /// The number of providers we expect to have, so we usually
-                    /// don't have to re-allocate the vec.
-                    const NUM_PROVIDERS: usize = 3;
+                    /// Recursive helper to build a tree of providers
+                    #[async_recursion]
+                    async fn visit(
+                        settings: &Settings,
+                        config: &SuggestionProviderConfig,
+                    ) -> Result<Box<dyn SuggestionProvider>> {
+                        let provider: Box<dyn SuggestionProvider> = match config {
+                            SuggestionProviderConfig::RemoteSettings(rs_config) => {
+                                RemoteSettingsSuggester::new_boxed(settings, rs_config).await?
+                            }
+                            SuggestionProviderConfig::MemoryCache(memory_config) => {
+                                let inner = visit(settings, memory_config.inner.as_ref()).await?;
+                                MemoryCacheSuggester::new_boxed(memory_config, inner)
+                            }
+                            SuggestionProviderConfig::RedisCache(redis_config) => {
+                                let inner = visit(settings, redis_config.inner.as_ref()).await?;
+                                RedisCacheSuggester::new_boxed(settings, redis_config, inner)
+                                    .await?
+                            }
+                            SuggestionProviderConfig::Multiplexer(multi_config) => {
+                                let mut providers = Vec::new();
+                                for config in &multi_config.providers {
+                                    providers.push(visit(settings, config).await?);
+                                }
+                                Multi::new_boxed(providers)
+                            }
+                            SuggestionProviderConfig::Debug => DebugProvider::new_boxed(settings)?,
+                            SuggestionProviderConfig::WikiFruit => WikiFruit::new_boxed(settings)?,
+                            SuggestionProviderConfig::Null => Box::new(NullProvider),
+                        };
+                        Ok(provider)
+                    }
+
                     let mut providers: Vec<Box<dyn SuggestionProvider>> =
-                        Vec::with_capacity(NUM_PROVIDERS);
-
-                    if settings.providers.wiki_fruit.enabled {
-                        let wikifruit = WikiFruit::new_boxed(settings)?;
-                        providers.push(match settings.providers.wiki_fruit.cache {
-                            CacheType::None => wikifruit,
-                            CacheType::Redis => {
-                                RedisCacheSuggester::new_boxed(settings, wikifruit).await?
-                            }
-                            CacheType::Memory => {
-                                MemoryCacheSuggester::new_boxed(settings, wikifruit)
-                            }
-                        });
-                    }
-
-                    if settings.providers.adm_rs.enabled {
-                        let adm_rs = RemoteSettingsSuggester::new_boxed(settings).await?;
-                        providers.push(match settings.providers.adm_rs.cache {
-                            CacheType::None => adm_rs,
-                            CacheType::Redis => {
-                                RedisCacheSuggester::new_boxed(settings, adm_rs).await?
-                            }
-                            CacheType::Memory => MemoryCacheSuggester::new_boxed(settings, adm_rs),
-                        });
-                    }
-
-                    if settings.providers.enable_debug_provider {
-                        providers.push(DebugProvider::new_boxed(settings)?);
+                        Vec::with_capacity(settings.suggestion_providers.len());
+                    for config in settings.suggestion_providers.values() {
+                        providers.push(visit(settings, config).await?);
                     }
 
                     let multi = merino_suggest::Multi::new(providers);
