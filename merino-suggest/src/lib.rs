@@ -250,7 +250,7 @@ pub struct NullProvider;
 #[async_trait]
 impl SuggestionProvider for NullProvider {
     fn name(&self) -> String {
-        "null-provider".into()
+        "NullProvider".into()
     }
 
     async fn suggest(&self, _query: SuggestionRequest) -> Result<SuggestionResponse, SuggestError> {

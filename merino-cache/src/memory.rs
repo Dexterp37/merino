@@ -111,7 +111,7 @@ impl Suggester {
 #[async_trait]
 impl SuggestionProvider for Suggester {
     fn name(&self) -> String {
-        "in-memory-cache".into()
+        format!("MemoryCache({})", self.inner.name())
     }
 
     async fn suggest(

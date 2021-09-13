@@ -99,43 +99,10 @@ impl SuggestionProviderRef {
                         "Setting up suggestion providers"
                     );
 
-                    /// Recursive helper to build a tree of providers
-                    #[async_recursion]
-                    async fn visit(
-                        settings: &Settings,
-                        config: &SuggestionProviderConfig,
-                    ) -> Result<Box<dyn SuggestionProvider>> {
-                        let provider: Box<dyn SuggestionProvider> = match config {
-                            SuggestionProviderConfig::RemoteSettings(rs_config) => {
-                                RemoteSettingsSuggester::new_boxed(settings, rs_config).await?
-                            }
-                            SuggestionProviderConfig::MemoryCache(memory_config) => {
-                                let inner = visit(settings, memory_config.inner.as_ref()).await?;
-                                MemoryCacheSuggester::new_boxed(memory_config, inner)
-                            }
-                            SuggestionProviderConfig::RedisCache(redis_config) => {
-                                let inner = visit(settings, redis_config.inner.as_ref()).await?;
-                                RedisCacheSuggester::new_boxed(settings, redis_config, inner)
-                                    .await?
-                            }
-                            SuggestionProviderConfig::Multiplexer(multi_config) => {
-                                let mut providers = Vec::new();
-                                for config in &multi_config.providers {
-                                    providers.push(visit(settings, config).await?);
-                                }
-                                Multi::new_boxed(providers)
-                            }
-                            SuggestionProviderConfig::Debug => DebugProvider::new_boxed(settings)?,
-                            SuggestionProviderConfig::WikiFruit => WikiFruit::new_boxed(settings)?,
-                            SuggestionProviderConfig::Null => Box::new(NullProvider),
-                        };
-                        Ok(provider)
-                    }
-
                     let mut providers: Vec<Box<dyn SuggestionProvider>> =
                         Vec::with_capacity(settings.suggestion_providers.len());
                     for config in settings.suggestion_providers.values() {
-                        providers.push(visit(settings, config).await?);
+                        providers.push(make_provider_tree(settings, config).await?);
                     }
 
                     let multi = merino_suggest::Multi::new(providers);
@@ -145,6 +112,42 @@ impl SuggestionProviderRef {
             })
             .await
     }
+}
+
+/// Recursive helper to build a tree of providers.
+#[async_recursion]
+async fn make_provider_tree(
+    settings: &Settings,
+    config: &SuggestionProviderConfig,
+) -> Result<Box<dyn SuggestionProvider>> {
+    let provider: Box<dyn SuggestionProvider> = match config {
+        SuggestionProviderConfig::RemoteSettings(rs_config) => {
+            RemoteSettingsSuggester::new_boxed(settings, rs_config).await?
+        }
+
+        SuggestionProviderConfig::MemoryCache(memory_config) => {
+            let inner = make_provider_tree(settings, memory_config.inner.as_ref()).await?;
+            MemoryCacheSuggester::new_boxed(memory_config, inner)
+        }
+
+        SuggestionProviderConfig::RedisCache(redis_config) => {
+            let inner = make_provider_tree(settings, redis_config.inner.as_ref()).await?;
+            RedisCacheSuggester::new_boxed(settings, redis_config, inner).await?
+        }
+
+        SuggestionProviderConfig::Multiplexer(multi_config) => {
+            let mut providers = Vec::new();
+            for config in &multi_config.providers {
+                providers.push(make_provider_tree(settings, config).await?);
+            }
+            Multi::new_boxed(providers)
+        }
+
+        SuggestionProviderConfig::Debug => DebugProvider::new_boxed(settings)?,
+        SuggestionProviderConfig::WikiFruit => WikiFruit::new_boxed(settings)?,
+        SuggestionProviderConfig::Null => Box::new(NullProvider),
+    };
+    Ok(provider)
 }
 
 /// A mapper from the internal schema used by merino-suggest to the expected API.
@@ -185,5 +188,53 @@ impl<'a> Serialize for SuggestionWrapper<'a> {
         };
 
         generated.serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_provider_tree;
+    use anyhow::Result;
+    use merino_settings::{
+        providers::{
+            MemoryCacheConfig, MultiplexerConfig, RedisCacheConfig, SuggestionProviderConfig,
+        },
+        Settings,
+    };
+
+    #[tokio::test]
+    async fn test_providers_single() -> Result<()> {
+        let settings = Settings::load_for_tests();
+        let config = SuggestionProviderConfig::Null;
+        let provider_tree = make_provider_tree(&settings, &config).await?;
+        assert_eq!(provider_tree.name(), "NullProvider");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_providers_complex() -> Result<()> {
+        let mut settings = Settings::load_for_tests();
+        settings.debug = true;
+
+        let config = SuggestionProviderConfig::Multiplexer(MultiplexerConfig {
+            providers: vec![
+                SuggestionProviderConfig::Null,
+                SuggestionProviderConfig::RedisCache(RedisCacheConfig {
+                    inner: Box::new(SuggestionProviderConfig::MemoryCache(MemoryCacheConfig {
+                        inner: Box::new(SuggestionProviderConfig::WikiFruit),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
+                SuggestionProviderConfig::Null,
+            ],
+        });
+
+        let provider_tree = make_provider_tree(&settings, &config).await?;
+        assert_eq!(
+            provider_tree.name(),
+            "Multi(NullProvider, RedisCache(MemoryCache(WikiFruit)), NullProvider)"
+        );
+        Ok(())
     }
 }
